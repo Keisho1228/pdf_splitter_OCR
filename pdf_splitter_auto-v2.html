@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>pdf自動分割・分別</title>
+  <!-- ライブラリの読み込み -->
+  <script src="https://unpkg.com/pdf-lib"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.0/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.9.179/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4.0.2/dist/tesseract.min.js"></script>
+  <!-- ドラッグ＆ドロップ用 (Sortable.js) -->
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+  <style>
+    body { 
+      font-family: sans-serif; 
+      padding: 2em; 
+      max-width: 1200px; 
+      margin: auto; 
+    }
+    h1 { 
+      font-size: 1.5em; 
+      margin-bottom: 1em; 
+    }
+    .meta-inputs input { 
+      margin: 0.5em 0.5em 1em 0; 
+      padding: 0.4em; 
+      font-size: 1em; 
+    }
+    #pageList {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.5em;
+    }
+    .page-block {
+      border: 1px solid #ccc;
+      padding: 1em;
+      background: #fafafa;
+      border-radius: 8px;
+      box-shadow: 1px 1px 3px rgba(0,0,0,0.1);
+    }
+    canvas { 
+      border: 1px solid #ccc; 
+      display: block; 
+      margin-bottom: 0.5em; 
+      max-width: 100%; 
+    }
+    select { 
+      margin-bottom: 1em; 
+      padding: 0.3em; 
+    }
+    button { 
+      margin-top: 2em; 
+      padding: 0.6em 1.2em; 
+      font-size: 1.1em; 
+    }
+  </style>
+</head>
+<body>
+  <h1>pdf自動分割</h1>
+
+  <!-- PDFファイル入力とメタ情報 -->
+  <input type="file" id="fileInput" accept="application/pdf">
+  <div class="meta-inputs">
+    <input type="text" id="year" placeholder="年度">
+    <input type="text" id="school" placeholder="大学名">
+    <input type="text" id="subject" placeholder="科目">
+  </div>
+
+  <!-- ページ表示エリア -->
+  <div id="pageList"></div>
+  <button id="splitBtn">分割して保存</button>
+
+  <script>
+    const fileInput = document.getElementById("fileInput");
+    const pageList = document.getElementById("pageList");
+    const splitBtn = document.getElementById("splitBtn");
+
+    let pageGroups = [];
+    let originalArrayBuffer;
+
+    // 各種番号変換用マップ
+    const kanjiNums = { '一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10 };
+    const romanNums = { 'Ⅰ':1,'Ⅱ':2,'Ⅲ':3,'Ⅳ':4,'Ⅴ':5,'Ⅵ':6,'Ⅶ':7,'Ⅷ':8,'Ⅸ':9,'Ⅹ':10 };
+    const specialMap = { '①': '1','②': '2','③': '3','④': '4','⑤': '5','⑥': '6','⑦': '7','⑧': '8','⑨': '9','⑩': '10' };
+
+    function applySpecialCharMap(text) {
+      return text.replace(/[①-⑩]/g, c => specialMap[c] || c);
+    }
+
+    // OCRにより各ページ上部の大問情報を抽出
+    async function extractQuestionNumberFromOCR(canvas) {
+      const topCanvas = document.createElement('canvas');
+      const ctx = topCanvas.getContext('2d');
+      topCanvas.width = canvas.width;
+      topCanvas.height = canvas.height / 2;
+      ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height / 2, 0, 0, canvas.width, canvas.height / 2);
+
+      const result = await Tesseract.recognize(topCanvas, 'jpn', { logger: m => console.log(m) });
+      console.log("OCR result (raw):", result.data.text);
+
+      const lines = result.data.text.split("\n");
+      for (let line of lines) {
+        const clean = applySpecialCharMap(line.trim().replace(/\s+/g, ''));
+        if (clean.includes("下書き")) return -1; 
+        const match = clean.match(/第[ 　]*([0-9一二三四五六七八九十ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ])[ 　]*問/);
+        if (match) {
+          const char = match[1];
+          if (kanjiNums[char]) return kanjiNums[char];
+          if (romanNums[char]) return romanNums[char];
+          if (!isNaN(char)) return parseInt(char);
+        }
+      }
+      return 0;
+    }
+
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const arrayBuffer = await file.arrayBuffer();
+      originalArrayBuffer = arrayBuffer.slice(0);
+      const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+      const pdf = await loadingTask.promise;
+      const pageCount = pdf.numPages;
+      pageGroups = []; // 初期化
+
+      pageList.innerHTML = "";
+      let currentGroup = 0;
+      const usedGroups = new Set();
+
+      for (let i = 0; i < pageCount; i++) {
+        const page = await pdf.getPage(i + 1);
+        const viewport = page.getViewport({ scale: 2.5 });
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        await page.render({ canvasContext: context, viewport }).promise;
+
+        let group = await extractQuestionNumberFromOCR(canvas);
+        if (group === -1) {
+          group = 0;
+        } else if (group === 0) {
+          group = currentGroup;
+        } else if (currentGroup === 0 && group !== 1) {
+          group = 0;
+        } else if (usedGroups.has(group)) {
+          group = currentGroup;
+        } else if (group > currentGroup) {
+          currentGroup = group;
+          usedGroups.add(group);
+        } else {
+          group = currentGroup;
+        }
+
+        pageGroups.push({ index: i, group: group });
+
+        const container = document.createElement("div");
+        container.className = "page-block";
+        container.dataset.index = i;
+        container.innerHTML = `<div>ページ ${i + 1}</div>`;
+        container.appendChild(canvas);
+
+        const select = document.createElement("select");
+        select.innerHTML = `<option value="0">分割なし</option>` +
+          Array.from({ length: 10 }, (_, j) => `<option value="${j + 1}">大問 ${j + 1}</option>`).join("");
+        select.value = group;
+        select.addEventListener("change", e => {
+          const newVal = parseInt(e.target.value);
+          const idx = parseInt(container.dataset.index);
+          pageGroups[idx].group = newVal;
+        });
+        container.appendChild(select);
+
+        const cloneBtn = document.createElement("button");
+        cloneBtn.textContent = "複製";
+        cloneBtn.style.marginLeft = "1em";
+        cloneBtn.addEventListener("click", () => {
+          const idx = parseInt(container.dataset.index);
+          const originalData = pageGroups[idx];
+          const newIndex = pageGroups.length;
+          const newGroup = { ...originalData, index: newIndex };
+          pageGroups.push(newGroup);
+
+          const cloneCanvas = document.createElement("canvas");
+          cloneCanvas.width = canvas.width;
+          cloneCanvas.height = canvas.height;
+          const cloneCtx = cloneCanvas.getContext("2d");
+          cloneCtx.drawImage(canvas, 0, 0);
+
+          const newContainer = container.cloneNode(true);
+          newContainer.querySelector("canvas").replaceWith(cloneCanvas);
+          newContainer.dataset.index = newIndex;
+          pageList.appendChild(newContainer);
+        });
+        container.appendChild(cloneBtn);
+
+        pageList.appendChild(container);
+      }
+
+      new Sortable(pageList, {
+        animation: 150,
+        onEnd: () => {
+          const newOrder = [...pageList.children].map(block => parseInt(block.dataset.index));
+          const reordered = newOrder.map(i => pageGroups[i]);
+          pageGroups = reordered;
+          console.log("Reordered pageGroups:", pageGroups);
+        }
+      });
+    });
+
+    splitBtn.addEventListener("click", async () => {
+      if (!originalArrayBuffer) return alert("PDFを読み込んでください");
+
+      const originalPdf = await PDFLib.PDFDocument.load(originalArrayBuffer);
+      const zip = new JSZip();
+
+      const grouped = pageGroups.reduce((acc, p) => {
+        if (p.group === 0) return acc;
+        if (!acc[p.group]) acc[p.group] = [];
+        acc[p.group].push(p.index);
+        return acc;
+      }, {});
+
+      const school = document.getElementById("school").value || "school";
+      const year = document.getElementById("year").value || "year";
+      const subject = document.getElementById("subject").value || "subject";
+
+      for (const group in grouped) {
+        const newPdf = await PDFLib.PDFDocument.create();
+        const copiedPages = await newPdf.copyPages(originalPdf, grouped[group]);
+        copiedPages.forEach(pg => newPdf.addPage(pg));
+        const pdfBytes = await newPdf.save();
+        const name = `${year}_${school}_${subject}_大問${group}.pdf`;
+        zip.file(name, pdfBytes);
+      }
+
+      const content = await zip.generateAsync({ type: "blob" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(content);
+      a.download = `${year}_${school}_${subject}_分割.zip`;
+      a.click();
+    });
+  </script>
+</body>
+</html>
